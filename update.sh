@@ -22,6 +22,41 @@ if [[ ! "$TARGET_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$TARGET_PORT < 1 || 10#$TARGE
 fi
 TARGET_PORT=$((10#$TARGET_PORT))
 
+# File used to remember the address already sent to the router.  It can be
+# overridden when more than one rule is maintained on the same host.
+IPV6_STATE_FILE="${IPV6_STATE_FILE:-/tmp/vivo-firewall-last-ipv6}"
+
+IPV6=$(
+    ip -6 addr show scope global |
+    awk '/inet6/ && !/temporary/ && !/deprecated/ {
+        split($2,a,"/");
+        print a[1];
+        exit
+    }'
+)
+
+if [[ -z "$IPV6" ]]; then
+    echo "ERRO: Nenhum IPv6 global permanente foi encontrado."
+    exit 1
+fi
+
+SAVED_IPV6=""
+if [[ -f "$IPV6_STATE_FILE" ]]; then
+    IFS= read -r SAVED_IPV6 < "$IPV6_STATE_FILE" || true
+fi
+
+echo "IPv6 atual: $IPV6"
+if [[ "$IPV6" == "$SAVED_IPV6" ]]; then
+    echo "IPv6 inalterado desde a última atualização; nada a fazer."
+    exit 0
+fi
+
+if [[ -n "$SAVED_IPV6" ]]; then
+    echo "IPv6 mudou: $SAVED_IPV6 -> $IPV6"
+else
+    echo "Nenhum IPv6 anterior salvo; será criada/atualizada a regra."
+fi
+
 COOKIE_JAR="/tmp/router-cookies.txt"
 rm -f "$COOKIE_JAR"
 
@@ -189,17 +224,6 @@ else
 fi
 
 
-IPV6=$(
-    ip -6 addr show scope global |
-    awk '/inet6/ && !/temporary/ && !/deprecated/ {
-        split($2,a,"/");
-        print a[1];
-        exit
-    }'
-)
-
-echo "IPv6 atual: $IPV6"
-
 echo "Enviando solicitação para $RULE_ACTION_LABEL a regra do firewall..."
 
 RESPONSE=$(curl -sS -G \
@@ -231,4 +255,20 @@ if grep -q 'Invalid Session Key' <<< "$RESPONSE"; then
     exit 1
 fi
 
+STATE_DIR=$(dirname "$IPV6_STATE_FILE")
+if [[ ! -d "$STATE_DIR" ]]; then
+    echo "ERRO: O diretório do arquivo de estado não existe: $STATE_DIR"
+    exit 1
+fi
+
+# Only record the address after the router accepted the update, so a failed
+# request will be retried by the next cron execution.
+STATE_TMP=$(mktemp "${IPV6_STATE_FILE}.tmp.XXXXXX") || exit 1
+printf '%s\n' "$IPV6" > "$STATE_TMP" && mv -f "$STATE_TMP" "$IPV6_STATE_FILE" || {
+    rm -f "$STATE_TMP"
+    echo "ERRO: Não foi possível salvar o IPv6 em $IPV6_STATE_FILE"
+    exit 1
+}
+
 echo "Solicitação para $RULE_ACTION_LABEL a regra enviada."
+echo "IPv6 salvo em $IPV6_STATE_FILE"
